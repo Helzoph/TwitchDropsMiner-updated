@@ -3,7 +3,6 @@ from __future__ import annotations
 # import an additional thing for proper PyInstaller freeze support
 from multiprocessing import freeze_support
 
-
 if __name__ == "__main__":
     freeze_support()
     import io
@@ -16,7 +15,7 @@ if __name__ == "__main__":
     import traceback
     import tkinter as tk
     from tkinter import messagebox
-    from typing import IO, NoReturn
+    from typing import IO
 
     if sys.version_info >= (3, 10):
         import truststore
@@ -33,19 +32,30 @@ if __name__ == "__main__":
     warnings.simplefilter("default", ResourceWarning)
 
     class Parser(argparse.ArgumentParser):
+
         def __init__(self, *args, **kwargs) -> None:
             super().__init__(*args, **kwargs)
             self._message: io.StringIO = io.StringIO()
+            self.is_error: bool = False
+            self.status: int = 0
+            self.message: str = ""
 
-        def _print_message(self, message: str, file: IO[str] | None = None) -> None:
+        def _print_message(self,
+                           message: str,
+                           file: IO[str] | None = None) -> None:
             self._message.write(message)
             # print(message, file=self._message)
 
-        def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
+        def exit(self, status: int = 0, message: str | None = None) -> None:
             try:
-                super().exit(status, message)  # sys.exit(2)
+                super().exit(status, message)
+            except SystemExit:  # don't exit, but store the error message and handle it afterwards
+                self.is_error = True
+                self.status = status
+                self.message = self._message.getvalue()
             finally:
-                messagebox.showerror("Argument Parser Error", self._message.getvalue())
+                messagebox.showerror("Argument Parser Error",
+                                     self._message.getvalue())
 
     class ParsedArgs(argparse.Namespace):
         _verbose: int
@@ -87,43 +97,67 @@ if __name__ == "__main__":
                 return logging.INFO
             return logging.NOTSET
 
+    def show_error(title: str, message: str, cli: bool):
+        """
+        Show the error message to the console or a window, depending on whether CLI or GUI mode is specified.
+        """
+        if cli:  # for CLI mode
+            # Output the error message to the console
+            sys.stderr.write(f"{title}: {message}\n")
+        else:  # for GUI mode
+            # NOTE: any errors from the parser or settings file loading is shown via message box,
+            # for which we need a dummy invisible window
+            root = tk.Tk()
+            root.overrideredirect(True)
+            root.withdraw()
+            set_root_icon(root, resource_path("pickaxe.ico"))
+            root.update()
+            # Show the error message in a window
+            messagebox.showerror(title, message)
+            # dummy window isn't needed anymore
+            root.destroy()
+            del root
+
     # handle input parameters
-    # NOTE: parser output is shown via message box
-    # we also need a dummy invisible window for the parser
-    root = tk.Tk()
-    root.overrideredirect(True)
-    root.withdraw()
-    set_root_icon(root, resource_path("pickaxe.ico"))
-    root.update()
     parser = Parser(
         SELF_PATH.name,
         description="A program that allows you to mine timed drops on Twitch.",
     )
-    parser.add_argument("--version", action="version", version=f"v{__version__}")
+    parser.add_argument("--version",
+                        action="version",
+                        version=f"v{__version__}")
     parser.add_argument("-v", dest="_verbose", action="count", default=0)
     parser.add_argument("--tray", action="store_true")
     parser.add_argument("--log", action="store_true")
     # debug options
-    parser.add_argument(
-        "--debug-ws", dest="_debug_ws", action="store_true"
-    )
-    parser.add_argument(
-        "--debug-gql", dest="_debug_gql", action="store_true"
-    )
+    parser.add_argument("--cli", action="store_true")
+    # undocumented debug args
+    parser.add_argument("--debug-ws",
+                        dest="_debug_ws",
+                        action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--debug-gql",
+                        dest="_debug_gql",
+                        action="store_true",
+                        help=argparse.SUPPRESS)
     args = parser.parse_args(namespace=ParsedArgs())
+
+    if parser.is_error:
+        show_error("Argument Parser Error", parser.message, args.cli)
+        sys.exit(parser.status)
+
     # load settings
     try:
         settings = Settings(args)
     except Exception:
-        messagebox.showerror(
+        show_error(
             "Settings error",
-            f"There was an error while loading the settings file:\n\n{traceback.format_exc()}"
-        )
+            f"There was an error while loading the settings file:\n\n{traceback.format_exc()}",
+            args.cli)
         sys.exit(4)
-    # dummy window isn't needed anymore
-    root.destroy()
+
     # get rid of unneeded objects
-    del root, parser
+    del parser
 
     # client run
     async def main():
@@ -152,8 +186,10 @@ if __name__ == "__main__":
         client = Twitch(settings)
         loop = asyncio.get_running_loop()
         if sys.platform == "linux":
-            loop.add_signal_handler(signal.SIGINT, lambda *_: client.gui.close())
-            loop.add_signal_handler(signal.SIGTERM, lambda *_: client.gui.close())
+            loop.add_signal_handler(signal.SIGINT,
+                                    lambda *_: client.gui.close())
+            loop.add_signal_handler(signal.SIGTERM,
+                                    lambda *_: client.gui.close())
         try:
             await client.run()
         except CaptchaRequired:
